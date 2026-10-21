@@ -33,6 +33,7 @@ set -u
 
 DOMAIN="we-have-a-problem.com"
 HOSTS="dv-g3b-emudhra dv-g3b-aaa-emudhra"
+EXPECTED_BODY="hello"   # probe hosts return "<h1>hello</h1>"; guards against captive portals / intercepting proxies
 SCAN_DIR="${1:-}"
 TIMEOUT=8
 
@@ -70,18 +71,22 @@ verdict_line() {  # $1=label  $2=VULNERABLE|SAFE|INCONCLUSIVE|SKIP  $3=detail
 # $1 = curl binary to use; $2 = optional --cacert path ("" = that curl's default store).
 # Prints VULNERABLE if either host verifies, SAFE if both reject, else INCONCLUSIVE.
 probe_curl() {
-  local bin="$1" cacert="$2" h code vuln=0 inc=0
+  local bin="$1" cacert="$2" h code body vuln=0 inc=0
   for h in $HOSTS; do
     if [ -n "$cacert" ]; then
-      "$bin" -s -o /dev/null --max-time "$TIMEOUT" --cacert "$cacert" "https://$h.$DOMAIN/"
+      body=$("$bin" -s --max-time "$TIMEOUT" --cacert "$cacert" "https://$h.$DOMAIN/" 2>/dev/null)
     else
-      "$bin" -s -o /dev/null --max-time "$TIMEOUT" "https://$h.$DOMAIN/"
+      body=$("$bin" -s --max-time "$TIMEOUT" "https://$h.$DOMAIN/" 2>/dev/null)
     fi
     code=$?
     case "$code" in
-      0)     vuln=1 ;;        # handshake succeeded -> trusts the bad chain
-      60|51) : ;;             # 60 = cert verify failed, 51 = mismatch -> rejected
-      *)     inc=1 ;;         # 6 dns / 7 connect / 28 timeout / etc -> no egress?
+      0)                     # handshake succeeded; confirm we actually reached the probe host
+        case "$body" in
+          *"$EXPECTED_BODY"*) vuln=1 ;;   # genuine probe response -> trusts the bad chain
+          *)                  inc=1 ;;    # 200 from a captive portal / intercepting proxy -> can't trust this
+        esac ;;
+      60|51) : ;;            # 60 = cert verify failed, 51 = mismatch -> rejected (safe)
+      *)     inc=1 ;;        # 6 dns / 7 connect / 28 timeout / etc -> no egress?
     esac
   done
   if [ "$vuln" = 1 ]; then echo VULNERABLE
@@ -91,11 +96,15 @@ probe_curl() {
 
 # Same, but for an OpenSSL-style hashed cert directory (--capath).
 probe_capath() {
-  local bin="$1" dir="$2" h code vuln=0 inc=0
+  local bin="$1" dir="$2" h code body vuln=0 inc=0
   for h in $HOSTS; do
-    "$bin" -s -o /dev/null --max-time "$TIMEOUT" --capath "$dir" "https://$h.$DOMAIN/"
+    body=$("$bin" -s --max-time "$TIMEOUT" --capath "$dir" "https://$h.$DOMAIN/" 2>/dev/null)
     code=$?
-    case "$code" in 0) vuln=1 ;; 60|51) : ;; *) inc=1 ;; esac
+    case "$code" in
+      0) case "$body" in *"$EXPECTED_BODY"*) vuln=1 ;; *) inc=1 ;; esac ;;
+      60|51) : ;;
+      *) inc=1 ;;
+    esac
   done
   if [ "$vuln" = 1 ]; then echo VULNERABLE
   elif [ "$inc" = 1 ]; then echo INCONCLUSIVE
